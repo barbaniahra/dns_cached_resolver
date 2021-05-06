@@ -1,0 +1,5 @@
+A = 1
+AAAA = 28
+NS = 2
+PTR = 12
+CNAME = 5

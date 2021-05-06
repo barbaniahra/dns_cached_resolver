@@ -1,1 +1,3 @@
 ConfigArgParse==1.4
+pykka==3.0.0
+ipaddr==2.2.0
