@@ -41,6 +41,7 @@ def parse_args(argv):
     p.add_argument('--host', required=True, help='')
     p.add_argument('--port', required=True, type=int, help='')
     p.add_argument('--root_servers', required=True, action='append', help='')
+    p.add_argument('--cache_location', required=True, type=expanduser)
     args = p.parse_args(argv)
 
     return args
@@ -49,7 +50,7 @@ def main():
     args = parse_args(sys.argv[1:])
     set_logging_level(args.logging_level)
 
-    resolver_ref = Resolver.start(args.root_servers)
+    resolver_ref = Resolver.start(args.root_servers, args.cache_location)
 
     if args.protocol in {'tcp', 'both'}:
         ref = TCPListener.start(args.host, args.port, resolver_ref)

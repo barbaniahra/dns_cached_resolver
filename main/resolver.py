@@ -12,16 +12,20 @@ import random
 class Resolver(pykka.ThreadingActor):
     MAX_RECURSION = 10
 
-    def __init__(self, root_servers):
+    def __init__(self, root_servers, cache_location):
         super(Resolver, self).__init__()
-        self._root_servers = root_servers
+        self._root_servers = [
+            ('.', ns)
+            for ns in root_servers
+        ]
+        self.cache_location = cache_location
         self.cache = None
 
     def _init_cache(self):
-        if not self.cache:
-            self.cache = sqlite3.connect('cache.db')
-
         try:
+            if not self.cache:
+                self.cache = sqlite3.connect(self.cache_location)
+
             self.cache.cursor().execute("""
             CREATE TABLE IF NOT EXISTS cache (name TEXT, type INT, ttl INT, insertion_time INT, data BLOB, ns TEXT);
             """)
@@ -37,10 +41,10 @@ class Resolver(pykka.ThreadingActor):
             WHERE strftime('%s', 'now') - insertion_time > ttl;
             """)
             self.cache.commit()
-            cur.execute("""
+            changes = list(cur.execute("""
             SELECT changes();
-            """)
-            logging.info("Cleared up `{}` entries from cache".format(list(cur))[0][0])
+            """))[0][0]
+            logging.info("Cleared up `{}` entries from cache".format(changes))
         except Exception as e:
             logging.warning("Error with cache cleanup: `{}`, will continue w/o it".format(e))
 
@@ -140,6 +144,7 @@ class Resolver(pykka.ThreadingActor):
                             continue
                         if result in {NAMEERROR, REFUSED, SERVERFAILURE}:
                             # error
+                            logging.info('A problem occured during resolving, giving up: {}'.format(result))
                             return (request.with_AA(is_authoritative=False)
                                     .with_RA(is_available=True)
                                     .with_rcode(result)
@@ -150,6 +155,7 @@ class Resolver(pykka.ThreadingActor):
                         # there might be an answer
                         request.answers = result
                         request.header.ancount = len(result)
+                        logging.info('Got {} answers: {}'.format(len(result), result))
                         return (request.with_AA(is_authoritative=False)
                                        .with_RA(is_available=True)
                                        .with_rcode(NOERROR)
@@ -196,6 +202,7 @@ class Resolver(pykka.ThreadingActor):
                    and a.rtype in {A, AAAA}
             ]):
                 # not mentioned in additionals
+                logging.info('Trying to resolve NS server: {}'.format(authority.rdata.decode()))
                 self.answer(DNSQuestion(authority.rdata.decode(), A, qclass=1), recursion_lvl + 1)
 
     def answer(self, question: DNSQuestion, recursion_lvl=0) -> Union[int, List[DNSRecord]]:

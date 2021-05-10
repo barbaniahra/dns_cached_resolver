@@ -4,6 +4,7 @@ from main.utils import *
 from copy import deepcopy
 from main.constants import *
 import ipaddr
+import random
 
 
 @dataclasses.dataclass
@@ -65,7 +66,7 @@ class DNSRecord:
             name, _ = parse_name(data, i)
             rdata = name.encode()
             i += rdlength
-            rdlength = len(rdata)
+            rdlength = len(encode_name(rdata.decode()))
         else:
             rdata = data[i:i+rdlength]
             i += rdlength
@@ -73,7 +74,8 @@ class DNSRecord:
         return DNSRecord(rname, rtype, rclass, ttl, rdlength, rdata), i
 
     def to_bytes(self) -> bytes:
-        return encode_name(self.rname) + struct.pack('!HHIH', self.rtype, self.rclass, self.ttl,  self.rdlength) + self.rdata
+        rdata = encode_name(self.rdata.decode()) if self.rtype == NS else self.rdata
+        return encode_name(self.rname) + struct.pack('!HHIH', self.rtype, self.rclass, self.ttl,  self.rdlength) + rdata
 
     def as_ip(self) -> Optional[str]:
         b = ipaddr.Bytes(self.rdata)
@@ -94,7 +96,7 @@ class DNSMessage:
     @staticmethod
     def from_question(question):
         return DNSMessage(
-            DNSHeader(id=123,
+            DNSHeader(id=random.randrange(2 ** 16),
                       flags='0' * 16,
                       qdcount=1,
                       ancount=0,

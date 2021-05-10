@@ -13,7 +13,7 @@ setup(name='dns_cached_resolver',
       author_email='mrcontego@gmail.com',
       install_requires=open(os.path.join(CURRENT_DIRECTORY, 'requirements.txt')).readlines(),
       entry_points={
-            'console_scripts': ['dns_cached_resolver=main.dns_cached_resolver:main'],
+            'console_scripts': ['dns_cached_resolver=main.runner:main'],
       },
       packages=['main'],
       data_files=[(('dns_cached_resolver_resources'), ['resources/config.ini'])])
