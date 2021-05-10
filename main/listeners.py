@@ -2,6 +2,7 @@ import socket
 from pykka import ThreadingActor
 from abc import abstractmethod
 from main.utils import recv_tcp_message, send_tcp_message
+from main.messages import DNSMessage
 import logging
 
 
@@ -67,6 +68,13 @@ class UDPListener(BaseListener):
 
         response = self._resolver_ref.ask({'command': 'resolve', 'data': data})
         logging.debug('[{}] response is: {}'.format(self.__class__.__name__, response))
+
+        if len(response) > 512:
+            logging.info('UDP response is `{}` bytes length, truncating'.format(len(response)))
+            response = DNSMessage.parse(response)[0]
+            response.with_TC(is_truncated=True)
+            response = response.to_bytes()[:512]
+
         self._socket.sendto(response, addr)
 
 

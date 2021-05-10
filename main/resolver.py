@@ -3,12 +3,15 @@ from main.messages import DNSMessage, DNSRecord, DNSQuestion
 from main.utils import recv_tcp_message, send_tcp_message
 import socket
 import logging
-import random
 from main.constants import *
+from typing import List, Union
 import sqlite3
+import random
 
 
 class Resolver(pykka.ThreadingActor):
+    MAX_RECURSION = 10
+
     def __init__(self, root_servers):
         super(Resolver, self).__init__()
         self._root_servers = root_servers
@@ -60,44 +63,50 @@ class Resolver(pykka.ThreadingActor):
         except Exception as e:
             logging.warning("Error with cache insert: `{}`, will continue w/o it".format(e))
 
-    def _lookup_answer(self, question: DNSQuestion):
+    def _lookup_answer(self, question: DNSQuestion) -> List[DNSRecord]:
         try:
             cur = self.cache.cursor()
-            cache = list(cur.execute("""
-            SELECT data
+            results = list(cur.execute("""
+            SELECT DISTINCT data
             FROM cache
             WHERE LOWER(name) = LOWER(?) and type = ?
-            ORDER BY RANDOM()
-            LIMIT 1;
+            ORDER BY RANDOM();
             """, (question.qname, question.qtype)))
 
-            if cache:
-                record = DNSRecord.parse(cache[0][0], 0)[0]
-                logging.info('Got record `{}` from cache'.format(record))
-                return record
+            if results:
+                records = [
+                    DNSRecord.parse(row[0], 0)[0]
+                    for row in results
+                ]
+                logging.info('Got records `{}` from cache'.format(records))
+                return records
 
         except Exception as e:
             logging.warning("Error with lookup answer: `{}`, will continue w/o it".format(e))
 
-    def _lookup_delegate(self, qname):
+    def _lookup_delegates(self, qname):
         try:
             cur = self.cache.cursor()
-            delegate = list(cur.execute("""
-            SELECT a_data.data
+            results = list(cur.execute("""
+            SELECT DISTINCT a_data.data
             FROM cache ns_data
             JOIN cache a_data ON LOWER(ns_data.ns) = LOWER(a_data.name)
             WHERE LOWER(ns_data.name) = LOWER(?) 
 				and ns_data.type = 2
-				and a_data.type in (1, 28)
-            ORDER BY RANDOM()
-            LIMIT 1;
+				and a_data.type == 1
+            ORDER BY RANDOM();
             """, (qname,)))
 
-            if delegate:
-                delegate = DNSRecord.parse(delegate[0][0], 0)[0]
-                delegate = delegate.rname, delegate.as_ip()
-                logging.info('Got delegate `{}` from cache'.format(delegate))
-                return delegate
+            if results:
+                records = [
+                    (delegate.rname, delegate.as_ip())
+                    for delegate in [
+                        DNSRecord.parse(row[0], 0)[0]
+                        for row in results
+                    ]
+                ]
+                logging.info('Got delegates `{}` from cache'.format(records))
+                return records
 
         except Exception as e:
             logging.warning("Error with lookup delegate: `{}`, will continue w/o it".format(e))
@@ -108,87 +117,128 @@ class Resolver(pykka.ThreadingActor):
 
         if message.get('command') == 'resolve':
             data = message['data']
-            return self.resolve(data)
+            request, _ = DNSMessage.parse(data)
+            if len(request.questions) != 1:
+                return request.with_rcode(NOTIMPLEMENTED).as_response().to_bytes()
 
-    def resolve(self, data, recursion_level=0):
-        server = None
-        request, i = DNSMessage.parse(data)
+            if request.questions[0].qtype not in {A, AAAA, PTR, NS}:
+                return request.with_rcode(NOTIMPLEMENTED).as_response().to_bytes()
 
-        if recursion_level == 10:
-            response = request.with_AA(is_authoritative=False).with_RA(is_available=True).as_response()
-            logging.info('Giving up {}'.format(response))
-            return response.to_bytes()
+            request.header.ancount = 0
+            request.header.arcount = 0
+            request.header.nscount = 0
+            request.answers = []
+            request.additionals = []
+            request.authorities = []
 
-        answers = []
-        for question in request.questions:
-            answer = self._lookup_answer(question)
-            if answer:
-                answers.append(answer)
-            elif question.qtype in {A, AAAA}:
-                # find a suffix NS record:
+            try:
+                for _ in range(self.MAX_RECURSION):
+                    result = self.answer(request.questions[0])
+                    if isinstance(result, int):
+                        if result == NOERROR:
+                            # found new delegates, continue
+                            continue
+                        if result in {NAMEERROR, REFUSED, SERVERFAILURE}:
+                            # error
+                            return (request.with_AA(is_authoritative=False)
+                                    .with_RA(is_available=True)
+                                    .with_rcode(result)
+                                    .as_response()).to_bytes()
+                        else:
+                            raise Exception('Unknown int result: {}'.format(result))
+                    else:
+                        # there might be an answer
+                        request.answers = result
+                        request.header.ancount = len(result)
+                        return (request.with_AA(is_authoritative=False)
+                                       .with_RA(is_available=True)
+                                       .with_rcode(NOERROR)
+                                       .as_response()).to_bytes()
+                return (request.with_AA(is_authoritative=False)
+                               .with_RA(is_available=True)
+                               .with_rcode(NOERROR)
+                               .as_response()).to_bytes()
+            except Exception as e:
+                logging.error('Exception during resolving: [{}] {}'.format(type(e), e))
+                return request.with_rcode(SERVERFAILURE).as_response().to_bytes()
 
-                suffixes = []
-                suffix = ''
-                for s in reversed(question.qname.split('.')):
-                    suffix = s + suffix
-                    suffix = '.' + suffix
+    def where_to_ask(self, qname):
+        suffixes = []
+        suffix = ''
+        for s in reversed(qname.split('.')):
+            suffix = s + suffix
+            suffix = '.' + suffix
 
-                    if suffix.lstrip('.'):
-                        suffixes.append(suffix.lstrip('.'))
+            if suffix.lstrip('.'):
+                suffixes.append(suffix.lstrip('.'))
 
-                for suffix in reversed(suffixes):
-                    answer = self._lookup_delegate(suffix)
-                    if answer:
-                        server = answer
-                        break
+        for suffix in reversed(suffixes):  # ['some.example.com.', 'example.com.', 'com.']
+            delegates = self._lookup_delegates(suffix)
+            if delegates:
+                # find NS servers of the zone
+                return delegates
 
-        if len(answers) >= request.header.qdcount:
-            request.answers = answers
-            request.header.ancount = len(answers)
-            answer = request.with_AA(is_authoritative=False).with_RA(is_available=True).as_response()
-            logging.info('Got all answers from cache, returning: {}'.format(answer))
-            return answer.to_bytes()
+        # ask root servers
+        ns_servers = list(self._root_servers)
+        random.shuffle(ns_servers)
+        return ns_servers
 
-        if server is None:
-            # begin by asking random root server
-            server = ('.', random.choice(self._root_servers))
+    def fill_missing_ns(self, response, recursion_lvl):
+        if recursion_lvl == 5:
+            return
 
+        for authority in response.authorities:
+            if authority.rtype != NS:
+                continue
+            if not list([
+                a for a in response.additionals
+                if a.rname.lower() == authority.rdata.decode().lower()
+                   and a.rtype in {A, AAAA}
+            ]):
+                # not mentioned in additionals
+                self.answer(DNSQuestion(authority.rdata.decode(), A, qclass=1), recursion_lvl + 1)
+
+    def answer(self, question: DNSQuestion, recursion_lvl=0) -> Union[int, List[DNSRecord]]:
+        cached = self._lookup_answer(question)
+        if cached:
+            return cached
+
+        ns_servers = self.where_to_ask(question.qname)
+        had_errors = False
+        for ns in ns_servers:
+            try:
+                response = self.probe(DNSMessage.from_question(question), ns)
+                if response.header.rcode() in {NAMEERROR, REFUSED}:
+                    return response.header.rcode()
+                if response.answers:
+                    return response.answers
+                if response.authorities:
+                    self.fill_missing_ns(response, recursion_lvl)
+                    return NOERROR
+            except Exception as e:
+                logging.error('Error while talking to {}: [{}] {}'.format(ns, type(e), e))
+                had_errors = True
+        return SERVERFAILURE if had_errors else NAMEERROR
+
+    def probe(self, request, server):
         with socket.socket(socket.AF_INET,
                            socket.SOCK_STREAM) as s:
+            s.settimeout(5)
             s.connect((server[-1], 53))
-            response = self.probe(s, request, server)
 
-            to_check = []
-            for authority in response.authorities:
-                if authority.rtype != NS:
-                    continue
-                if not list([
-                    a for a in request.additionals
-                    if a.rname.lower() == authority.rdata.decode().lower()
-                        and a.rtype in {A, AAAA}
-                ]):
-                    for type in [A, AAAA]:
-                        to_check.append(DNSQuestion(authority.rdata.decode(), type, qclass=1))
-            for q in to_check:
-                new_query = request.with_RD(is_desired=False)
-                new_query.questions = [q]
-                new_query.header.qdcount = 1
-                self.probe(s, new_query, server)
+            # non recursive
+            request = request.with_RD(is_desired=False)
+            send_tcp_message(s, request.to_bytes())
 
-            return self.resolve(data, recursion_level + 1)
+            logging.info('Sent request to {}: {}'.format(server, request))
 
-    def probe(self, s, request, server):
-        # non recursive
-        request = request.with_RD(is_desired=False)
-        send_tcp_message(s, request.to_bytes())
+            resp_data = recv_tcp_message(s)
 
-        logging.info('Request to {}: {}'.format(server, request))
-
-        resp_data = recv_tcp_message(s)
         response = DNSMessage.parse(resp_data)[0]
+
+        logging.info('Response from {}: {}'.format(server, response))
 
         for r in response.records():
             self._insert_cache(r)
 
-        logging.info('Response from {}: {}'.format(server, response))
         return response

@@ -25,6 +25,8 @@ class DNSHeader:
     def to_bytes(self) -> bytes:
         return struct.pack('!HHHHHH', self.id, int(self.flags, base=2), self.qdcount, self.ancount, self.nscount, self.arcount)
 
+    def rcode(self):
+        return int(self.flags[12:], base=2)
 
 @dataclasses.dataclass
 class DNSQuestion:
@@ -90,6 +92,22 @@ class DNSMessage:
     additionals: List[DNSRecord]
 
     @staticmethod
+    def from_question(question):
+        return DNSMessage(
+            DNSHeader(id=123,
+                      flags='0' * 16,
+                      qdcount=1,
+                      ancount=0,
+                      nscount=0,
+                      arcount=0),
+            questions=[question],
+            answers=[],
+            authorities=[],
+            additionals=[]
+        )
+
+
+    @staticmethod
     def parse(data, i=0):
         header, i = DNSHeader.parse(data, i)
         questions = []
@@ -133,6 +151,15 @@ class DNSMessage:
 
     def with_RA(self, is_available: bool):
         return self._with_flag(8, is_available)
+
+    def with_rcode(self, rcode: int):
+        bits = "{0:0>4b}".format(rcode)
+
+        result = self
+        for i, v in enumerate(bits):
+            result = result._with_flag(12 + i, v == '1')
+
+        return result
 
     def records(self):
         yield from self.answers
